@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from dotenv import load_dotenv
-from openai import OpenAI, OpenAIError
+from openai import NotFoundError, OpenAI, OpenAIError, RateLimitError
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
@@ -35,6 +35,8 @@ STOPWORD_TEXT = (
 )
 STOPWORDS = frozenset(STOPWORD_TEXT.split())
 SOURCE_REPEAT_DECAY = 0.9
+RATE_LIMIT_RETRIES = 4
+RATE_LIMIT_WAIT_SECONDS = 40
 ProgressCallback = Callable[[str], None]
 
 
@@ -250,17 +252,51 @@ class OpenAIGenerator:
             raise RuntimeError("OPENAI_API_KEY is missing from .env")
         if not self.model:
             raise RuntimeError("OPENAI_MODEL is missing from .env")
+        # The SDK also reads OPENAI_BASE_URL, so OpenAI-compatible providers work.
         self.client = OpenAI(api_key=api_key)
         self.max_output_tokens = max_output_tokens
+        self.use_chat_completions = False
 
     def generate(self, prompt: str) -> str:
-        response = self.client.responses.create(
-            model=self.model,
-            input=prompt,
-            temperature=0,
-            max_output_tokens=self.max_output_tokens,
-        )
-        answer = response.output_text.strip()
+        # Free-tier providers enforce per-minute request quotas (HTTP 429).
+        # Wait for the quota window to reset instead of aborting the run.
+        for attempt in range(1, RATE_LIMIT_RETRIES + 1):
+            try:
+                return self._generate_once(prompt)
+            except RateLimitError:
+                if attempt == RATE_LIMIT_RETRIES:
+                    raise
+                print(
+                    f"  rate limited; waiting {RATE_LIMIT_WAIT_SECONDS}s "
+                    f"(retry {attempt}/{RATE_LIMIT_RETRIES - 1})",
+                    flush=True,
+                )
+                time.sleep(RATE_LIMIT_WAIT_SECONDS)
+        raise RuntimeError("unreachable")
+
+    def _generate_once(self, prompt: str) -> str:
+        if not self.use_chat_completions:
+            try:
+                response = self.client.responses.create(
+                    model=self.model,
+                    input=prompt,
+                    temperature=0,
+                    max_output_tokens=self.max_output_tokens,
+                )
+                answer = response.output_text.strip()
+            except NotFoundError:
+                # Some OpenAI-compatible endpoints (e.g. Gemini) lack the
+                # Responses API; fall back to Chat Completions with the same
+                # prompt and generation settings.
+                self.use_chat_completions = True
+        if self.use_chat_completions:
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=self.max_output_tokens,
+            )
+            answer = (completion.choices[0].message.content or "").strip()
         if not answer:
             raise RuntimeError("OpenAI returned an empty answer")
         return answer
